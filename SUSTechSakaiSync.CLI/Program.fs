@@ -53,23 +53,37 @@ let getServerDirResources (config:SyncConfig) dir =
         return response.Resources |> Seq.skip(1)
     }
 
+let shouldExclude (excl:seq<string>) = 
+    fun (x:string) -> excl |> Seq.exists(fun ex -> x.StartsWith ex)
+
+let isWindowsNT = Environment.OSVersion.Platform = PlatformID.Win32NT
+
+let fitOSPathString (uri:string) = 
+    match isWindowsNT with
+    | true -> uri.Replace("/", "\\")
+    | false -> uri
+
 let rec getServerFilesPerSource (config:SyncConfig) (res:ConfigResource) dir = 
-    let excl = res.Excludes
-    let resources = dir |> getServerDirResources config |> Async.RunSynchronously
+    let exclDir = res.Excludes |> Seq.map(fun ex -> res.ServerRoot + ex) |> shouldExclude
+    let keepRes = fun (res:WebDavResource) -> res.Uri |> exclDir |> not
+    let resources = 
+        dir 
+        |> getServerDirResources config 
+        |> Async.RunSynchronously 
+        |> Seq.filter(keepRes)
+
+    let rootLen = sakaiUri + res.ServerRoot |> String.length
     let files = 
         resources 
-        |> Seq.filter(fun r-> r.IsCollection |> not &&
-                     excl |> Seq.exists(fun ex -> r.DisplayName.StartsWith (res.ServerRoot+ex)) |> not) 
+        |> Seq.filter(fun r-> r.IsCollection |> not) 
         |> Seq.map(fun r -> 
-                    let rootLen = sakaiUri + res.ServerRoot |> String.length
                     let uri = sakaiUri + r.Uri |> Uri.UnescapeDataString
-                    (uri, uri.[rootLen..].Replace("/", "\\"), res.LocalRoot, r.LastModifiedDate.Value) )
+                    (uri, uri.[rootLen..] |> fitOSPathString, res.LocalRoot, r.LastModifiedDate.Value) )
         |> Seq.map(ServerFileInfo)
 
     let filesInSubDirs = 
         resources 
-        |> Seq.filter(fun r-> r.IsCollection &&
-                     excl |> Seq.exists(fun ex -> r.Uri.StartsWith (res.ServerRoot+ex)) |> not) 
+        |> Seq.filter(fun r-> r.IsCollection) 
         |> Seq.collect(fun r -> getServerFilesPerSource config res r.Uri) 
     
     Seq.concat [ files; filesInSubDirs ]
@@ -93,8 +107,8 @@ let syncFile (uri:string) (localPath:string) (config:SyncConfig) =
 [<EntryPoint>]
 let main argv =
     let config  = File.ReadAllText("SyncConfig.xml") |> XElement.Parse |> SyncConfig
-    let localFiles = config |> getLocalFiles |> Seq.toList
-    let serverFiles = config |> getServerFiles |> Seq.toList
+    let localFiles = config |> getLocalFiles
+    let serverFiles = config |> getServerFiles
     let syncItems = 
         query {
             for sf in serverFiles do
@@ -105,7 +119,9 @@ let main argv =
                   |null -> true
                   |_ -> sf.LastModified > lf.LastModified)
             select (sf.Uri, sf.LocaRoot+sf.RelativePath)
-        }
+        } 
+        |> Seq.toList
+    
     syncItems 
     |> Seq.map(fun (uri, local) -> syncFile uri local config) 
     |> Async.Parallel
