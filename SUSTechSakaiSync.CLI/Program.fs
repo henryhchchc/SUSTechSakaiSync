@@ -18,16 +18,18 @@ type SyncConfig(xmlElement:XElement) =
     member this.Resources = xmlElement.Nodes() |> Seq.cast<XElement> |> Seq.map(ConfigResource)
 
 [<AllowNullLiteral>]
-type LocalFileInfo(path:string, relativePath:string, lastModified: DateTime) = 
+type LocalFileInfo(path:string, relativePath:string, lastModified: DateTime, size:int64) = 
     member this.Path = path
     member this.RelativePath = relativePath
     member this.LastModified = lastModified
+    member this.Size = size
 
-type ServerFileInfo(uri:string, relativePath:string, localRoot:string, lastModified: DateTime) = 
+type ServerFileInfo(uri:string, relativePath:string, localRoot:string, lastModified: DateTime, size:int64) = 
     member this.Uri = uri
     member this.RelativePath = relativePath
     member this.LocaRoot = localRoot
     member this.LastModified = lastModified
+    member this.Size = size
 
 let getDirectoryFiles path = Directory.GetFiles(path ,"*", SearchOption.AllDirectories)
 
@@ -38,7 +40,7 @@ let getLocalFiles (conf:SyncConfig) =
                             |> Seq.map(fun p -> (p, p.[r.LocalRoot.Length..]) )
                   )
     |> Seq.map(fun (p, r) -> (FileInfo p, r) )
-    |> Seq.map(fun (fi, r) -> (fi.FullName, r, fi.LastWriteTime) )
+    |> Seq.map(fun (fi, r) -> (fi.FullName, r, fi.LastWriteTime, fi.Length) )
     |> Seq.map(LocalFileInfo)
     
 
@@ -56,12 +58,11 @@ let getServerDirResources (config:SyncConfig) dir =
 let shouldExclude (excl:seq<string>) = 
     fun (x:string) -> excl |> Seq.exists(fun ex -> x.StartsWith ex)
 
-let isWindowsNT = Environment.OSVersion.Platform = PlatformID.Win32NT
 
 let fitOSPathString (uri:string) = 
-    match isWindowsNT with
-    | true -> uri.Replace("/", "\\")
-    | false -> uri
+    match Environment.OSVersion.Platform with
+    | PlatformID.MacOSX | PlatformID.Unix -> uri
+    | _ -> uri.Replace("/", "\\")
 
 let rec getServerFilesPerSource (config:SyncConfig) (res:ConfigResource) dir = 
     let exclDir = res.Excludes |> Seq.map(fun ex -> res.ServerRoot + ex) |> shouldExclude
@@ -78,7 +79,7 @@ let rec getServerFilesPerSource (config:SyncConfig) (res:ConfigResource) dir =
         |> Seq.filter(fun r-> r.IsCollection |> not) 
         |> Seq.map(fun r -> 
                     let uri = sakaiUri + r.Uri |> Uri.UnescapeDataString
-                    (uri, uri.[rootLen..] |> fitOSPathString, res.LocalRoot, r.LastModifiedDate.Value) )
+                    (uri, uri.[rootLen..] |> fitOSPathString, res.LocalRoot, r.LastModifiedDate.Value, (int64)r.ContentLength.Value) )
         |> Seq.map(ServerFileInfo)
 
     let filesInSubDirs = 
@@ -92,21 +93,24 @@ let getServerFiles (config:SyncConfig) =
     config.Resources |> Seq.collect(fun r -> getServerFilesPerSource config r r.ServerRoot)
 
 let syncFile (uri:string) (localPath:string) (config:SyncConfig) = 
+    printfn "%s" uri
     async {
-        printfn "%s -> %s" uri localPath
         let credentials = new NetworkCredential(config.UserName, config.Password)
         let param = WebDavClientParams(Credentials = credentials)
         use client = new WebDavClient(param)
         let! response = client.GetRawFile(uri) |> Async.AwaitTask
         localPath |> Path.GetDirectoryName |> Directory.CreateDirectory |> ignore
+        if localPath |> File.Exists then localPath |> File.Delete
         use fs = new FileStream(localPath, FileMode.OpenOrCreate, FileAccess.Write)
         response.Stream.CopyToAsync fs |> Async.AwaitTask |> ignore
+        fs.Flush true
     }
     
 
 [<EntryPoint>]
 let main argv =
-    let config  = File.ReadAllText("SyncConfig.xml") |> XElement.Parse |> SyncConfig
+    let loadConfigFromFile = File.ReadAllText >> XElement.Parse >> SyncConfig
+    let config  = "SyncConfig.xml" |> loadConfigFromFile
     let localFiles = config |> getLocalFiles
     let serverFiles = config |> getServerFiles
     let syncItems = 
@@ -117,7 +121,7 @@ let main argv =
             for lf in result |> Enumerable.DefaultIfEmpty do
             where(match lf with
                   |null -> true
-                  |_ -> sf.LastModified > lf.LastModified)
+                  |_ -> sf.LastModified > lf.LastModified || lf.Size <= 0L)
             select (sf.Uri, sf.LocaRoot+sf.RelativePath)
         } 
         |> Seq.toList
